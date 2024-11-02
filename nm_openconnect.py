@@ -3,24 +3,29 @@
 nm-openconnect plugin. It can automatically feed password on stdin and pass
 form data in command line options as well.
 """
-
+import functools
 import logging
+import os
+import threading
 from argparse import ArgumentParser, Namespace
 from enum import IntEnum
 from functools import wraps
 from json import dumps
 from logging.handlers import SysLogHandler
 from os import getenv
-from subprocess import PIPE, Popen, TimeoutExpired
+from subprocess import Popen, PIPE, TimeoutExpired
+from time import sleep
 from typing import Any, Optional
 
 import dbus
 import dbus.mainloop.glib
 import dbus.service
+import netifaces as ni
 from dbus.service import method, signal
 from gi.repository import GLib
+from netaddr.ip import IPAddress
 
-NM_DBUS_SERVICE_OPENCONNECT = 'org.freedesktop.NetworkManager.openconnect'
+NM_DBUS_SERVICE_CISCO = 'org.freedesktop.NetworkManager.cisco'
 NM_DBUS_INTERFACE = 'org.freedesktop.NetworkManager.VPN.Plugin'
 NM_DBUS_PATH = '/org/freedesktop/NetworkManager/VPN/Plugin'
 
@@ -28,7 +33,7 @@ NM_VPN_LOG_LEVEL = getenv('NM_VPN_LOG_LEVEL', '0')
 NM_VPN_LOG_SYSLOG = getenv('NM_VPN_LOG_SYSLOG', '1')
 
 parser = ArgumentParser()
-parser.add_argument('--bus-name', default=NM_DBUS_SERVICE_OPENCONNECT,
+parser.add_argument('--bus-name', default=NM_DBUS_SERVICE_CISCO,
                     help='D-Bus name to use for this instance')
 parser.add_argument('--persist', default=False, action='store_true',
                     help='don’t quit when VPN connection terminates')
@@ -39,8 +44,9 @@ parser.add_argument('--debug', default=False, action='store_true',
 def trace(fn):
     @wraps(fn)
     def traced(self, *args, **kwargs):
-        logger.info('nm-oc: %s(%s, %s)', fn.__name__, args, kwargs)
+        logger.debug('nm-oc: %s(%s, %s)', fn.__name__, args, kwargs)
         return fn(self, *args, **kwargs)
+
     return traced
 
 
@@ -62,7 +68,6 @@ def convert(obj):
 
 
 class ServiceState(IntEnum):
-
     Unknown = 0
 
     Init = 1
@@ -79,7 +84,6 @@ class ServiceState(IntEnum):
 
 
 class InteractiveNotSupportedError(dbus.DBusException):
-
     _dbus_error_name = \
         'org.freedesktop.NetworkManager.VPN.Error.InteractiveNotSupported'
 
@@ -109,36 +113,51 @@ class Plugin(dbus.service.Object):
     def Connect(self, connection: dict[str, dict[str, Any]]):
         # TODO(@daskol): What config we should use?
         connection = convert(connection)
-        logger.info('nm-oc: Connect(%s)', connection)
-
-        # See original implementation for details.
-        #
-        # [1]: https://gitlab.gnome.org/GNOME/NetworkManager-openconnect/-/
-        #      blob/1.2.10/src/nm-openconnect-service.c?ref_type=tags#L496-504
-        protocol = ()
-        if self.protocol and self.protocol != 'anyconnect':
-            protocol = ('--protocol', protocol)
+        logger.debug('nm-oc: Connect(%s)', connection)
 
         env = {'NM_DBUS_SERVICE_OPENCONNECT': self.bus_name}  # Helper script.
-        cmd = [
-            'openconnect', '-u', self.username, '--passwd-on-stdin',
-            '--script', '/usr/lib/nm-openconnect-service-openconnect-helper',
-            '--syslog', *protocol, *self.form_data, self.gateway
-        ]
-        logger.info('command to connect: %s', dumps(cmd, ensure_ascii=False))
+        cmd = ['su', '-', 'pvranik', '/home/pvranik/bin/ciscovpn-2fa.sh', '--', 'start']
+        logger.debug('command to connect: %s', dumps(cmd, ensure_ascii=False))
         self.StateChanged(ServiceState.Starting)
+
+        # os.system('su - pvranik /home/pvranik/bin/ciscovpn-2fa.sh -- start')
         self.proc = Popen(cmd, stdin=PIPE, stdout=PIPE, stderr=PIPE, env=env)
-        try:
-            input = f'{self.password}\n'.encode('utf-8')
-            outs, errs = self.proc.communicate(input, timeout=5.0)
-            logger.info('connected to %s: stdout: %s; stderr: %s',
-                        self.gateway, outs, errs)
-        except TimeoutExpired:
-            logger.info('communication timed out')
-        except Exception:
-            self.proc.kill()
-            outs, errs = self.proc.communicate()
-            logger.info('stdout: %s\nstderr: %s', outs, errs)
+
+        def _connection_callback():
+            try:
+                input = f'{self.password}\n'.encode('utf-8')
+                input = ''
+                outs, errs = self.proc.communicate(input, timeout=15.0)
+                self.proc.wait(timeout=60.0)
+                logger.debug('connected to %s: stdout: %s; stderr: %s',
+                             self.gateway, outs, errs)
+            except TimeoutExpired:
+                logger.warning('communication timed out')
+            except Exception as e:
+                self.proc.kill()
+                outs, errs = self.proc.communicate()
+                logger.error('err: %s\nstdout: %s\nstderr: %s', e, outs, errs)
+
+            sleep(1)
+            inet_ = ni.ifaddresses('cscotun0')[ni.AF_INET][0]
+
+            logger.debug('inet: %s', inet_)
+
+            self.SetConfig(dbus.Dictionary({
+                "tundev": dbus.String("cscotun0"),
+                # 'has-ip4': dbus.Boolean(True),
+                # 'has-ip6': dbus.Boolean(False),
+                # 'method': dbus.String("auto"),
+                'gateway': dbus.UInt32(IPAddress("185.40.248.34").ipv4()),
+                #'internal-gateway': dbus.UInt32(IPAddress(inet_['peer']).ipv4()),
+                'internal-gateway': dbus.UInt32(IPAddress("192.168.0.1").ipv4()),
+            }, signature="sv"))
+
+            self.SetIp4Config(dbus.Dictionary({'address': dbus.UInt32(IPAddress(inet_['addr']).ipv4()),
+                                               'prefix': dbus.UInt32(IPAddress(inet_['netmask']).netmask_bits())}))
+
+        thread = threading.Thread(target=_connection_callback)
+        thread.start()
 
     @method(dbus_interface=NM_DBUS_INTERFACE,
             in_signature='a{sa{sv}}a{sv}')
@@ -152,6 +171,7 @@ class Plugin(dbus.service.Object):
             out_signature='s')
     @trace
     def NeedSecrets(self, settings: dict[str, dict[str, Any]]) -> str:
+
         vpn = settings.get('vpn', {})
         data = vpn.get('data', {})
         self.username = data.get('username')
@@ -171,23 +191,44 @@ class Plugin(dbus.service.Object):
         if (password := secrets.get('password')):
             self.password = password
 
+        self.password = "pwd"
+        self.gateway = "host"
+        self.username = "user"
+        self.protocol = "cisco"
         section = ''  # Secret section?
         if self.password is None:
             section = 'vpn'
+
+        logger.debug("form_data: %s", self.form_data)
+        logger.debug("password: %s", self.password)
+        logger.debug("username: %s", self.username)
+        logger.debug("protocol: %s", self.protocol)
+        logger.debug("gateway: %s", self.gateway)
+        logger.debug("section: %s", section)
         return section
 
     @method(dbus_interface=NM_DBUS_INTERFACE)
     @trace
     def Disconnect(self):
+
+        #os.system('su - pvranik /home/pvranik/bin/ciscovpn-2fa.sh -- stop')
         if self.proc is None:
-            logger.info('openconnect binary has not been run: skipping it')
+            logger.debug('openconnect binary has not been run: skipping it')
         else:
             self.proc.kill()
             self.proc.wait()
-            logger.info('exit code of openconnect binary is %d',
-                        self.proc.returncode)
+            logger.debug('exit code of openconnect binary is %d',
+                         self.proc.returncode)
 
-        logger.info('send stop signal to event loop')
+        env = {'NM_DBUS_SERVICE_OPENCONNECT': self.bus_name}  # Helper script.
+        cmd = ['su', '-', 'pvranik', '/home/pvranik/bin/ciscovpn-2fa.sh', '--', 'stop']
+        self.proc = Popen(cmd, stdin=PIPE, stdout=PIPE, stderr=PIPE, env=env)
+        input = ''
+        outs, errs = self.proc.communicate(input, timeout=15.0)
+        self.proc.wait(timeout=60.0)
+        logger.debug('connected to %s: stdout: %s; stderr: %s',
+                     self.gateway, outs, errs)
+        logger.debug('send stop signal to event loop')
         self.loop.quit()
 
     @method(dbus_interface=NM_DBUS_INTERFACE, in_signature='a{sv}')
@@ -195,8 +236,8 @@ class Plugin(dbus.service.Object):
     def SetConfig(self, config: dict[str, Any]):
         self.config = {}
         for key in ('banner', 'tundev', 'gateway', 'mtu'):
-            if (val := config.get('banner')) is not None:
-                self.config['banner'] = val
+            if (val := config.get(key)) is not None:
+                self.config[key] = val
         self.Config(config)
 
     @method(dbus_interface=NM_DBUS_INTERFACE, in_signature='a{sv}')
@@ -205,6 +246,9 @@ class Plugin(dbus.service.Object):
         self.ip4config = {str(k): v for k, v in config.items()}
         self.Ip4Config({**self.config, **self.ip4config})
         self.StateChanged(ServiceState.Started)
+
+        inet_ = ni.ifaddresses('cscotun0')[ni.AF_INET][0]
+        logger.debug('inet: %s', inet_)
 
     @method(dbus_interface=NM_DBUS_INTERFACE, in_signature='a{sv}')
     @trace
@@ -219,7 +263,10 @@ class Plugin(dbus.service.Object):
     @method(dbus_interface=NM_DBUS_INTERFACE, in_signature='a{sa{sv}}')
     @trace
     def NewSecrets(self, connection: dict[str, dict[str, Any]]):
-        pass
+        self.password = "pwd"
+        self.gateway = "obsc"
+        self.username = "user"
+        self.protocol = "cisco"
 
     @signal(dbus_interface=NM_DBUS_INTERFACE, signature='u')
     @trace
@@ -245,8 +292,7 @@ class Plugin(dbus.service.Object):
         logger.info('ip6config: %s', dumps(ip6config, ensure_ascii=False))
 
 
-class OpenConnectPlugin(dbus.service.Object):
-
+class CiscoPlugin(dbus.service.Object):
     pass
 
 
@@ -268,10 +314,12 @@ def main():
     # Configure logger on start up.
     global logger
     logger = logging.getLogger(__name__)
-    logger.setLevel(logging.INFO)
+    logger.setLevel(logging.DEBUG)
     handler = SysLogHandler(facility=SysLogHandler.LOG_DAEMON, address='/dev/log')
     logger.addHandler(handler)
+    logger.debug("ENV: %s", dumps("\n".join((f'{k}={v}' for k, v in os.environ.items()))))
     logger.debug('nm-oc: argv: %s', ns)
+    logger.debug('nm-oc: user: %s:%s', os.geteuid(), os.getegid())
 
     try:
         run(ns)
