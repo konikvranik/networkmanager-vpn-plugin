@@ -3,7 +3,6 @@
 nm-openconnect plugin. It can automatically feed password on stdin and pass
 form data in command line options as well.
 """
-import functools
 import logging
 import os
 import threading
@@ -13,6 +12,7 @@ from functools import wraps
 from json import dumps
 from logging.handlers import SysLogHandler
 from os import getenv
+from pwd import getpwnam
 from subprocess import Popen, PIPE, TimeoutExpired
 from time import sleep
 from typing import Any, Optional
@@ -99,10 +99,14 @@ class Plugin(dbus.service.Object):
         self.loop = loop
 
         self.gateway: Optional[str] = None
-        self.password: Optional[str] = None
+        self.command: Optional[str] = None
+        self.otp_command: Optional[str] = None
+        self.secret_command: Optional[str] = None
         self.username: Optional[str] = None
-        self.protocol: Optional[str] = None
-        self.form_data: list[str] = []
+        self.totp: Optional[str] = None
+        self.secret: Optional[str] = None
+        self.password: Optional[str] = None
+        self.otp: Optional[str] = None
 
     def run(self):
         self.loop.run()
@@ -116,18 +120,18 @@ class Plugin(dbus.service.Object):
         logger.debug('nm-oc: Connect(%s)', connection)
 
         env = {'NM_DBUS_SERVICE_OPENCONNECT': self.bus_name}  # Helper script.
-        cmd = ['su', '-', 'pvranik', '/home/pvranik/bin/ciscovpn-2fa.sh', '--', 'start']
+        cmd = [self.command, '-s', 'connect', self.gateway]
         logger.debug('command to connect: %s', dumps(cmd, ensure_ascii=False))
         self.StateChanged(ServiceState.Starting)
 
-        # os.system('su - pvranik /home/pvranik/bin/ciscovpn-2fa.sh -- start')
-        self.proc = Popen(cmd, stdin=PIPE, stdout=PIPE, stderr=PIPE, env=env)
+        pwn = getpwnam(self.username)
+        self.proc = Popen(cmd, stdin=PIPE, stdout=PIPE, stderr=PIPE, env=env,
+                          preexec_fn=_demote(pwn.pw_uid, pwn.pw_gid, pwn.pw_dir))
 
         def _connection_callback():
             try:
-                input = f'{self.password}\n'.encode('utf-8')
-                input = ''
-                outs, errs = self.proc.communicate(input, timeout=15.0)
+                input = f'{self.username}\n{self.password}\n{self.otp}\n'.encode('utf-8')
+                outs, errs = self.proc.communicate(input, timeout=60.0)
                 self.proc.wait(timeout=60.0)
                 logger.debug('connected to %s: stdout: %s; stderr: %s',
                              self.gateway, outs, errs)
@@ -149,7 +153,7 @@ class Plugin(dbus.service.Object):
                 # 'has-ip6': dbus.Boolean(False),
                 # 'method': dbus.String("auto"),
                 'gateway': dbus.UInt32(IPAddress("185.40.248.34").ipv4()),
-                #'internal-gateway': dbus.UInt32(IPAddress(inet_['peer']).ipv4()),
+                # 'internal-gateway': dbus.UInt32(IPAddress(inet_['peer']).ipv4()),
                 'internal-gateway': dbus.UInt32(IPAddress("192.168.0.1").ipv4()),
             }, signature="sv"))
 
@@ -172,46 +176,51 @@ class Plugin(dbus.service.Object):
     @trace
     def NeedSecrets(self, settings: dict[str, dict[str, Any]]) -> str:
 
-        vpn = settings.get('vpn', {})
-        data = vpn.get('data', {})
-        self.username = data.get('username')
-        self.protocol = data.get('protocol')
-        self.gateway = data.get('gateway')
+        settings = convert(settings)
 
-        # Parse form data to command line terms.
-        form_data = []
-        for field in data.get('form', '').split(','):
-            if field:
-                form_data.extend(['-F', field])
-        if form_data:
-            self.form_data = form_data
+        vpn = settings.get('vpn', {})
+        logger.debug("VPN: %s", vpn)
+
+        data = vpn.get('data', {})
+        logger.debug("DATA: %s", data)
+
+        self.username = data.get('username')
+        self.totp = data.get('totp')
+        self.secret = data.get('secret')
+        self.gateway = data.get('gateway')
+        self.command = data.get('command')
+        self.otp_command = data.get('otp_command')
+        self.secret_command = data.get('secret_command')
 
         # Set or update password.
-        secrets = vpn.get('secrets', {})
-        if (password := secrets.get('password')):
-            self.password = password
+        pwn = getpwnam(self.username)
 
-        self.password = "pwd"
-        self.gateway = "host"
-        self.username = "user"
-        self.protocol = "cisco"
+        env = {'NM_DBUS_SERVICE_OPENCONNECT': self.bus_name}  # Helper script.
+        cmd = ['su', '-', self.username, self.otp_command, 'otp', self.totp]
+        self.proc = Popen(cmd, stdin=PIPE, stdout=PIPE, stderr=PIPE, env=env)
+        outs, errs = self.proc.communicate(timeout=5.0)
+        self.otp = outs.decode('utf-8').strip()
+        self.proc.wait(timeout=5.0)
+
+        cmd = ['su', '-', self.username, '-c', f"{self.secret_command} lookup password {self.secret}"]
+        logger.debug("secret cmd: %s", cmd)
+        self.proc = Popen(cmd, stdin=PIPE, stdout=PIPE, stderr=PIPE, env=env)
+        outs, errs = self.proc.communicate(timeout=5.0)
+        self.password = outs.decode('utf-8').strip()
+        self.proc.wait(timeout=5.0)
+        logger.debug('secret:\n%s\n%s', outs, errs)
+
         section = ''  # Secret section?
-        if self.password is None:
+        if not (self.password and self.otp):
             section = 'vpn'
 
-        logger.debug("form_data: %s", self.form_data)
-        logger.debug("password: %s", self.password)
-        logger.debug("username: %s", self.username)
-        logger.debug("protocol: %s", self.protocol)
-        logger.debug("gateway: %s", self.gateway)
-        logger.debug("section: %s", section)
         return section
 
     @method(dbus_interface=NM_DBUS_INTERFACE)
     @trace
     def Disconnect(self):
 
-        #os.system('su - pvranik /home/pvranik/bin/ciscovpn-2fa.sh -- stop')
+        # os.system('su - pvranik /home/pvranik/bin/ciscovpn-2fa.sh -- stop')
         if self.proc is None:
             logger.debug('openconnect binary has not been run: skipping it')
         else:
@@ -221,10 +230,11 @@ class Plugin(dbus.service.Object):
                          self.proc.returncode)
 
         env = {'NM_DBUS_SERVICE_OPENCONNECT': self.bus_name}  # Helper script.
-        cmd = ['su', '-', 'pvranik', '/home/pvranik/bin/ciscovpn-2fa.sh', '--', 'stop']
-        self.proc = Popen(cmd, stdin=PIPE, stdout=PIPE, stderr=PIPE, env=env)
-        input = ''
-        outs, errs = self.proc.communicate(input, timeout=15.0)
+        cmd = [self.command, 'disconnect']
+        pwn = getpwnam(self.username)
+        self.proc = Popen(cmd, stdin=PIPE, stdout=PIPE, stderr=PIPE, env=env,
+                          preexec_fn=_demote(pwn.pw_uid, pwn.pw_gid, pwn.pw_dir))
+        outs, errs = self.proc.communicate(timeout=30.0)
         self.proc.wait(timeout=60.0)
         logger.debug('connected to %s: stdout: %s; stderr: %s',
                      self.gateway, outs, errs)
@@ -263,10 +273,7 @@ class Plugin(dbus.service.Object):
     @method(dbus_interface=NM_DBUS_INTERFACE, in_signature='a{sa{sv}}')
     @trace
     def NewSecrets(self, connection: dict[str, dict[str, Any]]):
-        self.password = "pwd"
-        self.gateway = "obsc"
-        self.username = "user"
-        self.protocol = "cisco"
+        pass
 
     @signal(dbus_interface=NM_DBUS_INTERFACE, signature='u')
     @trace
@@ -290,6 +297,18 @@ class Plugin(dbus.service.Object):
     def Ip6Config(self, ip6config: dict[str, Any]):
         ip6config = convert(ip6config)
         logger.info('ip6config: %s', dumps(ip6config, ensure_ascii=False))
+
+
+def _demote(user_uid, user_gid, user_home):
+    """Pass the function 'set_ids' to preexec_fn, rather than just calling
+    setuid and setgid. This will change the ids for that subprocess only"""
+
+    def set_ids():
+        os.setgid(user_gid)
+        os.setuid(user_uid)
+        os.environ['HOME'] = user_home
+
+    return set_ids
 
 
 class CiscoPlugin(dbus.service.Object):
