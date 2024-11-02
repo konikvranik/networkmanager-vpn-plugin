@@ -64,12 +64,16 @@ which exposes plugin services to NetworkManager. As we finished with the
 following.
 
 ```ini
-# Config file: /usr/lib/NetworkManager/VPN/nm-openconnect-service.name
+# Config file: /usr/lib/NetworkManager/VPN/nm-cisco-service.name
 [VPN Connection]
-name=openconnect
-service=org.freedesktop.NetworkManager.openconnect
-program=/usr/local/bin/nm-openconnect  # Path to executable.
+name=cisco
+service=org.freedesktop.NetworkManager.cisco
+program=/home/pvranik/git/priv/networkmanager-vpn-plugin/nm_openconnect.py
 supports-multiple-connections=true
+
+[GNOME]
+auth-dialog=/usr/libexec/nm-openconnect-auth-dialog
+
 ```
 
 Finally, we should reload NetworkManager and activate our VPN connection.
@@ -87,14 +91,21 @@ the difference with original configuration file. The rest of fields are pretty
 the same as in the original configuration (if they are used at all).
 
 ```
-[vpn]
-service-type=org.freedesktop.NetworkManager.openconnect
-password-flags=0  # Do not ask agent for secrets.
-username=your-username-here  # Username.
-form=main:group_list=AccessVPN,main:field=value  # Comma-separated form data.
+[connection]
+id=cisco-vpn
+uuid=....
+type=vpn
+autoconnect=false
 
-[vpn-secrets]
-password=your-password-here  # Password in plaintext.
+[vpn]
+service-type=org.freedesktop.NetworkManager.cisco
+gateway=URL of the Cisco GW
+totp=Name of the totp secret
+secret=name of the password secret
+username=username
+command=/opt/cisco/secureclient/bin/vpn
+otp_command=/usr/bin/pass
+secret_command=/usr/bin/secret-tool
 ```
 
 **NOTE** Some configuration options are not used at all but it is simple enough
